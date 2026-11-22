@@ -1,0 +1,7 @@
+# Install prebuilt adz zipapp + default config + udev rule into a custom Fedora/Bazzite image
+COPY dist/adz /usr/lib/hestia/anti-deadzone/adz
+COPY config.example.json /etc/hestia/anti-deadzone/config.json
+COPY packaging/udev/99-uinput.rules /etc/udev/rules.d/99-uinput.rules
+RUN chmod 0755 /usr/lib/hestia/anti-deadzone/adz && \
+    chmod 0644 /etc/hestia/anti-deadzone/config.json /etc/udev/rules.d/99-uinput.rules && \
+    ln -sf /usr/lib/hestia/anti-deadzone/adz /usr/bin/adz

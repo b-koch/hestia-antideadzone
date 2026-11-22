@@ -1,0 +1,53 @@
+{
+  "_comment": "Hestia Anti-Deadzone configuration. Keys starting with '_' are ignored.",
+  "paused": false,
+  "device_name_match": "",
+  "active_profile": "default",
+  "max_output_hz": 500,
+  "reload_interval": 1.0,
+  "rescan_interval": 1.0,
+  "debug_sample_rate": 0,
+  "realtime_priority": false,
+  "profiles": {
+    "default": {
+      "left": {
+        "deadzone_shape": "radial",
+        "deadzone": 0.05,
+        "outer_deadzone": 0.0,
+        "anti_deadzone": 0.15,
+        "curve": 1.0
+      },
+      "right": {
+        "deadzone_shape": "bowtie",
+        "deadzone": 0.02,
+        "outer_deadzone": 0.0,
+        "axial_deadzone": 0.12,
+        "anti_deadzone": 0.2,
+        "curve": 1.25
+      },
+      "left_trigger": {
+        "deadzone": 0.0,
+        "outer_deadzone": 0.0
+      },
+      "right_trigger": {
+        "deadzone": 0.0,
+        "outer_deadzone": 0.0
+      }
+    },
+    "hall-effect": {
+      "left": {
+        "deadzone_shape": "radial",
+        "deadzone": 0.0025,
+        "anti_deadzone": 0.2,
+        "curve": 1.0
+      },
+      "right": {
+        "deadzone_shape": "bowtie",
+        "deadzone": 0.0025,
+        "axial_deadzone": 0.14,
+        "anti_deadzone": 0.25,
+        "curve": 1.35
+      }
+    }
+  }
+}
