@@ -14,7 +14,7 @@ When paused (`adz pause`), the daemon releases its exclusive grab (`EVIOCGRAB`) 
 * **True Bypass / Pause Mode:** `adz pause` ungrabs your physical pad and removes the virtual Xbox 360 device immediately, letting you keep the systemd user service running permanently while opting in only for games that need it.
 * **Instant Updates + `inotify` Hot-Reload:** CLI commands write atomically to `config.json` and signal the running daemon (`SIGHUP`) to apply changes immediately, while manual edits are picked up instantaneously via Linux `inotify` (with automatic fallback polling via `reload_interval`).
 * **Event-Driven Hotplugging & Single-Instance Lock:** Uses non-blocking `pyudev` netlink monitoring to detect controller connections/disconnections without busy-polling, protected by an exclusive `flock` lock so duplicate daemon instances cannot spawn extra virtual controllers.
-* **Stick & Trigger Shaping with 4096-Entry Curve LUTs:** Supports `radial`, `radial_unscaled`, `bowtie`, `axial`, `axial_unscaled`, `sloped_axial`, `sloped_axial_unscaled`, and `hybrid` stick geometries with inner/outer deadzones, plus independent left/right trigger deadzone, outer deadzone, anti-deadzone, and curve shaping.
+* **Stick & Trigger Shaping with 4096-Entry Curve LUTs:** Supports `radial`, `radial_unscaled`, `bowtie`, `axial`, `axial_unscaled`, `sloped_axial`, `sloped_axial_unscaled`, `hybrid`, `square`, `square_unscaled`, `squircle`, and `smooth_axial` stick geometries with inner/outer deadzones, plus independent left/right trigger deadzone, outer deadzone, anti-deadzone, and curve shaping.
 * **Rumble Passthrough & D-Pad Normalization:** Forwards `EV_FF` rumble/periodic effects and gain from games back to the physical controller and normalizes `BTN_DPAD_*` buttons into Xbox 360 hat axes.
 * **Optional Polling Rate Cap & Low-Jitter Runtime:** Coalesces high-polling-rate stick events (e.g., 500 Hz or 1000 Hz controllers) down to `max_output_hz` while sending buttons and triggers immediately, alongside `CLOCK_MONOTONIC` timestamps, cyclic GC suppression during active streaming, and optional real-time scheduling (`--rt`).
 
@@ -286,7 +286,7 @@ Each profile configures `"left"` and `"right"` sticks independently:
 | `anti_deadzone` | `float` | `0.25` | Minimum output magnitude ($0.0$–$1.0$) applied once the stick leaves the deadzone, countering a game's built-in deadzone. |
 | `curve` | `float` | `1.0` | Power response curve exponent applied after rescaling. `$1.0$` is linear; `$> 1.0$` gives finer precision near center; `$< 1.0$` is faster near center. Ignored by `_unscaled` shapes. |
 | `deadzone_shape` | `string` | `"radial"` | Deadzone and anti-deadzone geometry (see table below). |
-| `axial_deadzone` | `float` | `null` | Optional cardinal/bowtie slope width ($0.0$–$0.95$). When omitted on `bowtie`, `sloped_axial`, `sloped_axial_unscaled`, or `hybrid` and `deadzone < 0.05`, it auto-derives from `anti_deadzone * 0.45` so low-deadzone Hall-effect sticks still get clean cardinal locking. |
+| `axial_deadzone` | `float` | `null` | Shape-specific secondary width/gain ($0.0$–$1.0$). Sets the cardinal/bowtie cone slope on `bowtie`/`sloped_axial`/`hybrid` (auto-derives from `anti_deadzone * 0.45` when `deadzone < 0.05`), diagonal squareness blend on `squircle` (default `0.55`), and cardinal axis ramp width on `smooth_axial` (default `0.06`). |
 | `sloped_dominance_curve` | `float` | `1.0` | Controls how smoothly `anti_deadzone` ramps onto the minor axis in `sloped_axial` and `hybrid` (`0.0` = full boost immediately outside the bowtie; `1.0` = smooth Hermite ramp; `> 1.0` = stronger cardinal bias). |
 | `outer_circle_clamp` | `boolean` | `false` (`true` on `hybrid`) | Clamps diagonal output vector magnitude to $\le 1.0$ so diagonals do not exceed cardinal turn speeds. |
 
@@ -313,7 +313,11 @@ Optional per-trigger shaping blocks normalized to Xbox 360 trigger output (`0`�
 | **`axial_unscaled`** | Independent per-axis flat deadzone without rescaling from $0$. |
 | **`sloped_axial`** | Wedge-shaped per-axis deadzone combined with a smooth Hermite dominance ramp on the minor axis. Defeats square in-game deadzones while avoiding sudden cardinal-to-diagonal snapping. |
 | **`sloped_axial_unscaled`** | Unscaled variant of `sloped_axial`. |
-| **`hybrid`** | Two-stage shaping: circular center deadzone + single radial response curve first, followed by bowtie per-axis shaping and outer-circle normalization. |
+| **`hybrid`** | Two-stage shaping: circular center deadzone + single radial response curve first, followed by bowtie per-axis shaping with symmetric diagonal anti-deadzone and outer-circle normalization. |
+| **`square`** | Chebyshev ($L_\infty$) square deadzone and square outer boundary with rescaling from $0$. |
+| **`square_unscaled`** | Unscaled variant of `square` without rescaling from $0$ after leaving the square deadzone. |
+| **`squircle`** | Circular inner deadzone that smoothly blends toward a square outer boundary along diagonals (`axial_deadzone` controls squareness, default `0.55`). |
+| **`smooth_axial`** | Circular inner deadzone followed by independent per-axis $C^1$ Hermite anti-deadzone ramps (`axial_deadzone` controls ramp width, default `0.06`), eliminating sudden axis snapping. |
 
 ## Development & AI Attribution
 

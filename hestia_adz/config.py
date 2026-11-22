@@ -243,8 +243,8 @@ def _validate_stick(
     if not isinstance(curve, (int, float)) or isinstance(curve, bool) or curve <= 0.0:
         errors.append(f"{context}.curve: must be a positive number (> 0.0)")
     if axial is not None:
-        if not isinstance(axial, (int, float)) or isinstance(axial, bool) or not (0.0 <= axial <= 0.95):
-            errors.append(f"{context}.axial_deadzone: must be null or a float in [0.0, 0.95]")
+        if not isinstance(axial, (int, float)) or isinstance(axial, bool) or not (0.0 <= axial <= 1.0):
+            errors.append(f"{context}.axial_deadzone: must be null or a float in [0.0, 1.0]")
     if not isinstance(dom, (int, float)) or isinstance(dom, bool) or dom < 0.0:
         errors.append(f"{context}.sloped_dominance_curve: must be a non-negative number (>= 0.0)")
     if clamp is not None and not isinstance(clamp, bool):
