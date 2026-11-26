@@ -25,22 +25,32 @@ APP_ID = "io.github.b_koch.HestiaAntiDeadzone"
 
 SHAPES = [
     "radial",
+    "radial_unscaled",
     "axial",
+    "axial_unscaled",
     "sloped_axial",
+    "sloped_axial_unscaled",
     "smooth_axial",
     "bowtie",
+    "hybrid",
     "squircle",
     "square",
+    "square_unscaled",
 ]
 
 SHAPE_LABELS = [
     "Radial",
+    "Radial (Unscaled)",
     "Axial",
+    "Axial (Unscaled)",
     "Sloped Axial",
+    "Sloped Axial (Unscaled)",
     "Smooth Axial",
     "Bowtie",
+    "Hybrid",
     "Squircle",
     "Square",
+    "Square (Unscaled)",
 ]
 
 STICK_DEFAULTS: dict[str, Any] = {
@@ -202,7 +212,9 @@ class AdzWindow(Adw.ApplicationWindow):
 
         self._load_config()
         self._build_ui()
-        self._sync_ui_from_config()
+        self._sync_ui_from_config(rebuild_profiles=True)
+
+        self.connect("close-request", self._on_close_request)
 
         if self._load_error:
             GLib.idle_add(self._show_toast, self._load_error)
@@ -212,6 +224,12 @@ class AdzWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------------
     # Config I/O & Daemon IPC
     # ------------------------------------------------------------------
+    def _profile_names(self) -> list[str]:
+        return [
+            k for k, v in self.config["profiles"].items()
+            if not str(k).startswith("_") and isinstance(v, dict)
+        ]
+
     def _load_config(self) -> None:
         self._load_error = None
         if not self.config_path.exists():
@@ -220,7 +238,7 @@ class AdzWindow(Adw.ApplicationWindow):
                 "paused": False,
                 "device_name_match": "",
                 "active_profile": "default",
-                "max_output_hz": 250,
+                "max_output_hz": 0,
                 "reload_interval": 1.0,
                 "rescan_interval": 1.0,
                 "debug_sample_rate": 0,
@@ -246,20 +264,24 @@ class AdzWindow(Adw.ApplicationWindow):
             raw = {}
 
         profiles = raw.get("profiles")
-        if not isinstance(profiles, dict) or not profiles:
+        if not isinstance(profiles, dict) or not any(
+            not str(k).startswith("_") and isinstance(v, dict) for k, v in profiles.items()
+        ):
             raw["profiles"] = {"default": copy.deepcopy(NEW_PROFILE_TEMPLATE)}
 
-        for name, prof in raw["profiles"].items():
+        for name, prof in list(raw["profiles"].items()):
+            if str(name).startswith("_"):
+                continue
             if not isinstance(prof, dict):
                 raw["profiles"][name] = copy.deepcopy(NEW_PROFILE_TEMPLATE)
                 continue
             prof.setdefault("left", {})
             prof.setdefault("right", {})
 
-        if raw.get("active_profile") not in raw["profiles"]:
-            raw["active_profile"] = next(iter(raw["profiles"]))
-
         self.config = raw
+        valid_names = self._profile_names()
+        if raw.get("active_profile") not in valid_names:
+            raw["active_profile"] = valid_names[0]
 
     def _write_config_atomic(self, notify_daemon: bool = True) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,11 +312,21 @@ class AdzWindow(Adw.ApplicationWindow):
         self._save_timer_id = GLib.timeout_add(150, self._commit_save)
 
     def _commit_save(self) -> bool:
-        self._save_timer_id = None
+        if self._save_timer_id is not None:
+            tid = self._save_timer_id
+            self._save_timer_id = None
+            src = GLib.main_context_default().find_source_by_id(tid)
+            if src is not None and not src.is_destroyed():
+                GLib.source_remove(tid)
         try:
             self._write_config_atomic(notify_daemon=True)
         except Exception as exc:
             self._show_toast(f"Save failed: {exc}")
+        return False
+
+    def _on_close_request(self, *_args: Any) -> bool:
+        if self._save_timer_id is not None:
+            self._commit_save()
         return False
 
     def _get_daemon_pid(self) -> int | None:
@@ -374,7 +406,9 @@ class AdzWindow(Adw.ApplicationWindow):
         )
         page.add(profile_group)
 
+        self.profile_model = Gtk.StringList.new([])
         self.profile_row = Adw.ComboRow(title="Active Profile")
+        self.profile_row.set_model(self.profile_model)
         self.profile_row.set_enable_search(True)
         self.profile_row.connect("notify::selected", self._on_profile_selected)
         profile_group.add(self.profile_row)
@@ -431,7 +465,7 @@ class AdzWindow(Adw.ApplicationWindow):
         stick_group.add(stick_sel_row)
 
         self.curve_preview = ResponseCurvePreview()
-        preview_row = Adw.ActionRow()
+        preview_row = Adw.PreferencesRow(activatable=False, focusable=False)
         preview_row.set_child(self.curve_preview)
         stick_group.add(preview_row)
 
@@ -556,7 +590,7 @@ class AdzWindow(Adw.ApplicationWindow):
 
         self.paused_row = Adw.SwitchRow(
             title="Bypass Shaping (Paused)",
-            subtitle="Pass physical controller inputs unmodified to the virtual Xbox 360 device",
+            subtitle="Release physical controller and remove virtual Xbox 360 device",
         )
         self.paused_row.connect("notify::active", self._on_global_changed)
         global_group.add(self.paused_row)
@@ -565,8 +599,9 @@ class AdzWindow(Adw.ApplicationWindow):
         self.device_match_row.connect("changed", self._on_global_changed)
         global_group.add(self.device_match_row)
 
-        self.hz_row = Adw.SpinRow.new_with_range(60, 2000, 10)
+        self.hz_row = Adw.SpinRow.new_with_range(0, 2000, 10)
         self.hz_row.set_title("Max Output Polling Rate (Hz)")
+        self.hz_row.set_subtitle("0 = uncapped (native controller polling rate)")
         self.hz_row.set_digits(0)
         self.hz_row.connect("notify::value", self._on_global_changed)
         global_group.add(self.hz_row)
@@ -594,7 +629,7 @@ class AdzWindow(Adw.ApplicationWindow):
 
         self.rt_prio_row = Adw.SwitchRow(
             title="Realtime Scheduling Priority",
-            subtitle="Request SCHED_FIFO / elevated priority when permitted",
+            subtitle="Request SCHED_RR / elevated priority when permitted",
         )
         self.rt_prio_row.connect("notify::active", self._on_global_changed)
         global_group.add(self.rt_prio_row)
@@ -626,13 +661,27 @@ class AdzWindow(Adw.ApplicationWindow):
     def _current_profile(self) -> dict[str, Any]:
         return self.config["profiles"][self._current_profile_name()]
 
-    def _sync_ui_from_config(self) -> None:
+    def _sync_profile_fields(self) -> None:
+        """Sync stick and trigger controls for the active profile without touching profile_row."""
         self._updating_ui = True
         try:
-            names = list(self.config["profiles"].keys())
+            self._sync_stick_ui()
+            self._sync_trigger_ui()
+            self._refresh_daemon_status()
+        finally:
+            self._updating_ui = False
+
+    def _sync_ui_from_config(self, *, rebuild_profiles: bool = False) -> None:
+        self._updating_ui = True
+        try:
+            names = self._profile_names()
             active = self._current_profile_name()
-            self.profile_row.set_model(Gtk.StringList.new(names))
-            self.profile_row.set_selected(names.index(active))
+            if rebuild_profiles:
+                self.profile_model.splice(0, self.profile_model.get_n_items(), names)
+            if active in names:
+                target_idx = names.index(active)
+                if self.profile_row.get_selected() != target_idx:
+                    self.profile_row.set_selected(target_idx)
             self.btn_delete.set_sensitive(len(names) > 1)
 
             paused = bool(self.config.get("paused", False))
@@ -641,7 +690,7 @@ class AdzWindow(Adw.ApplicationWindow):
             self.header_pause_btn.set_label("Paused" if paused else "Active")
 
             self.device_match_row.set_text(str(self.config.get("device_name_match", "")))
-            self.hz_row.set_value(float(self.config.get("max_output_hz", 250)))
+            self.hz_row.set_value(float(self.config.get("max_output_hz", 0)))
             self.reload_interval_row.set_value(float(self.config.get("reload_interval", 1.0)))
             self.rescan_interval_row.set_value(float(self.config.get("rescan_interval", 1.0)))
             self.debug_rate_row.set_value(float(self.config.get("debug_sample_rate", 0)))
@@ -759,7 +808,8 @@ class AdzWindow(Adw.ApplicationWindow):
         name = item.get_string()
         if name in self.config["profiles"] and name != self.config.get("active_profile"):
             self.config["active_profile"] = name
-            self._sync_ui_from_config()
+            # Never replace profile_row's model inside its own notify::selected signal
+            self._sync_profile_fields()
             self._schedule_save()
             self._show_toast(f"Switched to profile “{name}”")
 
@@ -852,6 +902,15 @@ class AdzWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------------
     # Profile CRUD Dialogs
     # ------------------------------------------------------------------
+    def _defer_profile_list_sync(self, toast_msg: str) -> None:
+        def _apply() -> bool:
+            self._sync_ui_from_config(rebuild_profiles=True)
+            self._schedule_save()
+            self._show_toast(toast_msg)
+            return False
+
+        GLib.idle_add(_apply)
+
     def _prompt_profile_name(
         self, heading: str, body: str, initial: str, confirm_label: str, on_accept: Any
     ) -> None:
@@ -868,7 +927,7 @@ class AdzWindow(Adw.ApplicationWindow):
         def _handle_response(dlg: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
             if dlg.choose_finish(result) == "confirm":
                 name = entry.get_text().strip()
-                if name:
+                if name and not name.startswith("_"):
                     on_accept(name)
 
         dialog.choose(self, None, _handle_response)
@@ -880,9 +939,7 @@ class AdzWindow(Adw.ApplicationWindow):
                 return
             self.config["profiles"][name] = copy.deepcopy(NEW_PROFILE_TEMPLATE)
             self.config["active_profile"] = name
-            self._sync_ui_from_config()
-            self._schedule_save()
-            self._show_toast(f"Created profile “{name}”")
+            self._defer_profile_list_sync(f"Created profile “{name}”")
 
         self._prompt_profile_name(
             "New Profile",
@@ -901,9 +958,7 @@ class AdzWindow(Adw.ApplicationWindow):
                 return
             self.config["profiles"][name] = copy.deepcopy(self.config["profiles"][src])
             self.config["active_profile"] = name
-            self._sync_ui_from_config()
-            self._schedule_save()
-            self._show_toast(f"Duplicated “{src}” → “{name}”")
+            self._defer_profile_list_sync(f"Duplicated “{src}” → “{name}”")
 
         self._prompt_profile_name(
             "Duplicate Profile",
@@ -927,9 +982,7 @@ class AdzWindow(Adw.ApplicationWindow):
                 rebuilt[new_name if k == old else k] = v
             self.config["profiles"] = rebuilt
             self.config["active_profile"] = new_name
-            self._sync_ui_from_config()
-            self._schedule_save()
-            self._show_toast(f"Renamed to “{new_name}”")
+            self._defer_profile_list_sync(f"Renamed to “{new_name}”")
 
         self._prompt_profile_name(
             "Rename Profile",
@@ -940,7 +993,7 @@ class AdzWindow(Adw.ApplicationWindow):
         )
 
     def _on_delete_profile(self, _btn: Gtk.Button) -> None:
-        if len(self.config["profiles"]) <= 1:
+        if len(self._profile_names()) <= 1:
             return
         target = self._current_profile_name()
         dialog = Adw.AlertDialog(
@@ -954,10 +1007,8 @@ class AdzWindow(Adw.ApplicationWindow):
         def _handle(dlg: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
             if dlg.choose_finish(result) == "delete":
                 del self.config["profiles"][target]
-                self.config["active_profile"] = next(iter(self.config["profiles"]))
-                self._sync_ui_from_config()
-                self._schedule_save()
-                self._show_toast(f"Deleted profile “{target}”")
+                self.config["active_profile"] = self._profile_names()[0]
+                self._defer_profile_list_sync(f"Deleted profile “{target}”")
 
         dialog.choose(self, None, _handle)
 
@@ -1003,7 +1054,7 @@ class AdzWindow(Adw.ApplicationWindow):
 
     def _action_reload_disk(self, *_args: Any) -> None:
         self._load_config()
-        self._sync_ui_from_config()
+        self._sync_ui_from_config(rebuild_profiles=True)
         self._show_toast(self._load_error or "Reloaded configuration from disk")
 
 
