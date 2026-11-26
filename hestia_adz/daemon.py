@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import functools
 import logging
@@ -44,6 +45,18 @@ from .virtual_device import (
 LOG = logging.getLogger("adz.daemon")
 
 PASSTHROUGH_BUTTONS = frozenset(VIRTUAL_BUTTONS)
+STARTUP_RETRY_INTERVAL = 0.25
+STARTUP_RETRY_WINDOW_S = 10.0
+
+
+def _sysfs_input_name(event_path: str) -> str:
+    """Read /sys/class/input/eventX/device/name without needing /dev/input/eventX ACLs."""
+    try:
+        ev_name = os.path.basename(event_path)
+        sys_name = Path("/sys/class/input") / ev_name / "device" / "name"
+        return sys_name.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
 
 
 def is_physical_gamepad(dev: InputDevice) -> bool:
@@ -100,12 +113,20 @@ class AntiDeadzoneDaemon:
         self._reload_requested = False
         self._last_config_mtime = 0.0
         self._last_latency_flush = time.monotonic()
+        self._last_rescan_ts = 0.0
+        self._attach_burst_until = 0.0
+        self._last_blocked_log_ts = 0.0
 
         self.inotify: ConfigInotifyWatcher | None = None
         self.udev_monitor = None
         self._lock_fd: int | None = None
         self._wakeup_r: int = -1
         self._wakeup_w: int = -1
+
+    def _effective_rescan_interval(self, now: float) -> float:
+        if now < self._attach_burst_until:
+            return min(self.rescan_interval, STARTUP_RETRY_INTERVAL)
+        return self.rescan_interval
 
     def _acquire_instance_lock(self) -> bool:
         lock_path = PID_FILE_PATH.with_suffix(".lock")
@@ -167,7 +188,7 @@ class AntiDeadzoneDaemon:
             mon.start()
             self.udev_monitor = mon
             self.selector.register(mon.fileno(), selectors.EVENT_READ, data="udev")
-            LOG.info("Event-driven pyudev hotplug monitor active")
+            LOG.info("Event-driven pyudev hotplug monitor active (with %.1fs fallback rescan)", self.rescan_interval)
         except Exception as exc:
             LOG.warning("pyudev unavailable (%s); falling back to %.1fs device rescan", exc, self.rescan_interval)
 
@@ -220,6 +241,7 @@ class AntiDeadzoneDaemon:
                     self._enter_active_mode()
             elif not self.paused and match_changed:
                 self._detach_physical_device()
+                self._attach_burst_until = time.monotonic() + STARTUP_RETRY_WINDOW_S
                 self._scan_and_attach_physical()
 
             LOG.info(
@@ -251,6 +273,7 @@ class AntiDeadzoneDaemon:
             self.vdev.open()
             self.selector.register(self.vdev.fd, selectors.EVENT_READ, data="uinput")
         if self.phys_dev is None:
+            self._attach_burst_until = time.monotonic() + STARTUP_RETRY_WINDOW_S
             self._scan_and_attach_physical()
 
     def _detach_physical_device(self) -> None:
@@ -283,275 +306,18 @@ class AntiDeadzoneDaemon:
     def _scan_and_attach_physical(self) -> None:
         if self.paused or self.phys_dev is not None:
             return
+        now = time.monotonic()
+        self._last_rescan_ts = now
         match_sub = self.device_name_match.lower()
+        blocked_candidates: list[str] = []
+
         for path in sorted(list_devices()):
             try:
                 dev = InputDevice(path)
-            except OSError:
-                continue
-            if not is_physical_gamepad(dev):
-                dev.close()
-                continue
-            if match_sub and match_sub not in dev.name.lower():
-                dev.close()
-                continue
-
-            try:
-                dev.grab()
             except OSError as exc:
-                LOG.warning("Could not grab %s (%s): %s", dev.path, dev.name, exc)
-                dev.close()
-                continue
-
-            set_monotonic_clock(dev.fd)
-            os.set_blocking(dev.fd, False)
-
-            caps = dev.capabilities()
-            self._axis_ranges.clear()
-            for code, info in caps.get(ecodes.EV_ABS, []):
-                self._axis_ranges[code] = AxisRange(minimum=int(info.min), maximum=int(info.max))
-
-            self.phys_dev = dev
-            self.selector.register(dev.fd, selectors.EVENT_READ, data="phys")
-            self.vdev.reset_neutral()
-            self.vdev.attach_physical_ff(dev)
-            self.gc_guard.enter_streaming()
-            LOG.info("Grabbed physical gamepad %r (%s)", dev.name, dev.path)
-            self._notify_status()
-            return
-
-    def _normalize_stick_axis(self, code: int, raw_val: int) -> float:
-        rng = self._axis_ranges.get(code)
-        if rng is None:
-            return max(-1.0, min(1.0, raw_val / 32768.0))
-        mid = 0.5 * (rng.minimum + rng.maximum)
-        half = 0.5 * (rng.maximum - rng.minimum)
-        if half <= 0.0:
-            return 0.0
-        norm = (raw_val - mid) / half
-        if norm < -1.0:
-            return -1.0
-        if norm > 1.0:
-            return 1.0
-        return norm
-
-    def _emit_shaped_sticks(self, now_ns: int) -> None:
-        prof = self.profile
-        if prof is None:
-            return
-
-        lx_norm = self._normalize_stick_axis(ecodes.ABS_X, self._raw_lx)
-        ly_norm = self._normalize_stick_axis(ecodes.ABS_Y, self._raw_ly)
-        rx_norm = self._normalize_stick_axis(ecodes.ABS_RX, self._raw_rx)
-        ry_norm = self._normalize_stick_axis(ecodes.ABS_RY, self._raw_ry)
-
-        olx, oly = prof.left.shape_xy(lx_norm, ly_norm)
-        orx, ory = prof.right.shape_xy(rx_norm, ry_norm)
-
-        ilx = max(-32768, min(32767, int(round(olx * 32767.0))))
-        ily = max(-32768, min(32767, int(round(oly * 32767.0))))
-        irx = max(-32768, min(32767, int(round(orx * 32767.0))))
-        iry = max(-32768, min(32767, int(round(ory * 32767.0))))
-
-        self.vdev.queue_event(ecodes.EV_ABS, ecodes.ABS_X, ilx)
-        self.vdev.queue_event(ecodes.EV_ABS, ecodes.ABS_Y, ily)
-        self.vdev.queue_event(ecodes.EV_ABS, ecodes.ABS_RX, irx)
-        self.vdev.queue_event(ecodes.EV_ABS, ecodes.ABS_RY, iry)
-
-        self._sticks_dirty = False
-        self._last_stick_emit_ns = now_ns
-
-        if self.debug_sample_rate > 0:
-            self._sample_counter += 1
-            if self._sample_counter >= self.debug_sample_rate:
-                self._sample_counter = 0
-                LOG.debug(
-                    "L=(%.3f,%.3f)->(%d,%d) R=(%.3f,%.3f)->(%d,%d)",
-                    lx_norm, ly_norm, ilx, ily, rx_norm, ry_norm, irx, iry,
-                )
-
-    def _process_physical_events(self) -> None:
-        dev = self.phys_dev
-        prof = self.profile
-        if dev is None or prof is None:
-            return
-
-        read_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC) if self._live_latency else 0
-        try:
-            buf = os.read(dev.fd, EVENT_SIZE * 64)
-        except BlockingIOError:
-            return
-        except OSError as exc:
-            LOG.info("Physical controller disconnected (%s)", exc)
-            self._detach_physical_device()
-            self._notify_status()
-            return
-
-        if not buf:
-            self._detach_physical_device()
-            self._notify_status()
-            return
-
-        frame_ev_ns: int | None = None
-        max_hz = prof.max_output_hz
-        min_interval_ns = int(1_000_000_000 / max_hz) if max_hz > 0.0 else 0
-
-        for offset in range(0, len(buf) - EVENT_SIZE + 1, EVENT_SIZE):
-            sec, usec, ev_type, ev_code, ev_value = INPUT_EVENT_STRUCT.unpack_from(buf, offset)
-            if self._live_latency and frame_ev_ns is None and ev_type != ecodes.EV_SYN:
-                frame_ev_ns = sec * 1_000_000_000 + usec * 1_000
-
-            if ev_type == ecodes.EV_ABS:
-                if ev_code == ecodes.ABS_X:
-                    self._raw_lx = ev_value
-                    self._sticks_dirty = True
-                elif ev_code == ecodes.ABS_Y:
-                    self._raw_ly = ev_value
-                    self._sticks_dirty = True
-                elif ev_code == ecodes.ABS_RX:
-                    self._raw_rx = ev_value
-                    self._sticks_dirty = True
-                elif ev_code == ecodes.ABS_RY:
-                    self._raw_ry = ev_value
-                    self._sticks_dirty = True
-                elif ev_code == ecodes.ABS_Z:
-                    rng = self._axis_ranges.get(ecodes.ABS_Z)
-                    pmin, pmax = (rng.minimum, rng.maximum) if rng else (0, 255)
-                    shaped_lt = prof.left_trigger.shape_value(ev_value, pmin, pmax)
-                    self.vdev.queue_event(ecodes.EV_ABS, ecodes.ABS_Z, shaped_lt)
-                elif ev_code == ecodes.ABS_RZ:
-                    rng = self._axis_ranges.get(ecodes.ABS_RZ)
-                    pmin, pmax = (rng.minimum, rng.maximum) if rng else (0, 255)
-                    shaped_rt = prof.right_trigger.shape_value(ev_value, pmin, pmax)
-                    self.vdev.queue_event(ecodes.EV_ABS, ecodes.ABS_RZ, shaped_rt)
-                elif ev_code in (ecodes.ABS_HAT0X, ecodes.ABS_HAT0Y):
-                    self.vdev.queue_hat_axis(ev_code, ev_value)
-
-            elif ev_type == ecodes.EV_KEY:
-                if ev_code in DPAD_BUTTON_CODES:
-                    self.vdev.queue_dpad_button(ev_code, ev_value)
-                elif ev_code in PASSTHROUGH_BUTTONS:
-                    self.vdev.queue_button(ev_code, ev_value)
-
-            elif ev_type == ecodes.EV_SYN and ev_code == ecodes.SYN_REPORT:
-                now_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC) if (min_interval_ns or self._live_latency) else 0
-                proc_start_ns = now_ns
-
-                if self._sticks_dirty:
-                    if min_interval_ns == 0 or (now_ns - self._last_stick_emit_ns) >= min_interval_ns:
-                        self._emit_shaped_sticks(now_ns)
-
-                self.vdev.flush()
-
-                if self._live_latency and frame_ev_ns is not None:
-                    end_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
-                    self.latency_recorder.record(
-                        max(0.0, (read_ns - frame_ev_ns) / 1000.0),
-                        max(0.0, (end_ns - proc_start_ns) / 1000.0),
-                        max(0.0, (end_ns - frame_ev_ns) / 1000.0),
-                    )
-                    frame_ev_ns = None
-
-    def run(self) -> int:
-        if not self._acquire_instance_lock():
-            return 1
-        PID_FILE_PATH.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        self._setup_signals()
-        self._setup_watchers()
-        self.load_configuration(initial=True)
-
-        try:
-            while self.running:
-                if self._reload_requested:
-                    self._reload_requested = False
-                    if self.inotify is not None:
-                        self.inotify.rewatch()
-                    self.load_configuration(initial=False)
-
-                timeout = 1.0
-                if not self.paused and self._sticks_dirty and self.profile and self.profile.max_output_hz > 0:
-                    interval_s = 1.0 / self.profile.max_output_hz
-                    elapsed_s = (time.clock_gettime_ns(time.CLOCK_MONOTONIC) - self._last_stick_emit_ns) / 1e9
-                    timeout = max(0.0002, interval_s - elapsed_s)
-                elif not self.paused and self.phys_dev is None and self.udev_monitor is None:
-                    timeout = min(timeout, self.rescan_interval)
-                if self.inotify is None:
-                    timeout = min(timeout, self.reload_interval)
-
-                events = self.selector.select(timeout=timeout)
-                for key, _mask in events:
-                    tag = key.data
-                    if tag == "signal":
-                        try:
-                            os.read(self._wakeup_r, 64)
-                        except OSError:
-                            pass
-                    elif tag == "phys":
-                        self._process_physical_events()
-                    elif tag == "uinput":
-                        self.vdev.handle_uinput_events(self.phys_dev)
-                    elif tag == "inotify":
-                        if self.inotify is not None and self.inotify.drain_changed():
-                            self.load_configuration(initial=False)
-                    elif tag == "udev":
-                        if self.udev_monitor is not None:
-                            for dev in iter(functools.partial(self.udev_monitor.poll, 0), None):
-                                if dev.action in ("add", "change", "bind") and not self.paused and self.phys_dev is None:
-                                    self._scan_and_attach_physical()
-
-                if not self.paused and self._sticks_dirty and self.profile and self.profile.max_output_hz > 0:
-                    now_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
-                    min_ns = int(1_000_000_000 / self.profile.max_output_hz)
-                    if (now_ns - self._last_stick_emit_ns) >= min_ns:
-                        self._emit_shaped_sticks(now_ns)
-                        self.vdev.flush()
-
-                if self.inotify is None and self.config_path.exists():
-                    mtime = self.config_path.stat().st_mtime
-                    if mtime != self._last_config_mtime:
-                        self.load_configuration(initial=False)
-                if not self.paused and self.phys_dev is None and self.udev_monitor is None:
-                    self._scan_and_attach_physical()
-
-                if self._live_latency and (time.monotonic() - self._last_latency_flush) >= 2.0:
-                    if self.latency_recorder.count > 0:
-                        LOG.info("\n%s", self.latency_recorder.format_report("Live Telemetry"))
-                        self.latency_recorder.clear()
-                    self._last_latency_flush = time.monotonic()
-        finally:
-            sd_notify("STOPPING=1")
-            self._detach_physical_device()
-            if self.vdev.is_open:
-                try:
-                    self.selector.unregister(self.vdev.fd)
-                except KeyError:
-                    pass
-                self.vdev.close()
-            if self._wakeup_w >= 0:
-                try:
-                    signal.set_wakeup_fd(-1)
-                except (ValueError, OSError):
-                    pass
-                try:
-                    self.selector.unregister(self._wakeup_r)
-                except (KeyError, ValueError, OSError):
-                    pass
-                for fd in (self._wakeup_r, self._wakeup_w):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                self._wakeup_r = self._wakeup_w = -1
-            if self.inotify is not None:
-                self.inotify.close()
-            self.selector.close()
-            PID_FILE_PATH.unlink(missing_ok=True)
-            if self._lock_fd is not None:
-                try:
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                    os.close(self._lock_fd)
-                except OSError:
-                    pass
-                self._lock_fd = None
-            LOG.info("Daemon stopped cleanly")
-        return 0
+                if exc.errno in (errno.EACCES, errno.EPERM):
+                    sys_name = _sysfs_input_name(path)
+                    if (
+                        sys_name
+                        and sys_name != XBOX360_NAME
+                        and (not match

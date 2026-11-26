@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""GTK 4 / Libadwaita configuration and profile manager for hestia-antideadzone."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.b_koch.HestiaAntiDeadzone"
+
+SHAPES = [
+    "radial",
+    "axial",
+    "sloped_axial",
+    "smooth_axial",
+    "bowtie",
+    "squircle",
+    "square",
+]
+
+SHAPE_LABELS = [
+    "Radial",
+    "Axial",
+    "Sloped Axial",
+    "Smooth Axial",
+    "Bowtie",
+    "Squircle",
+    "Square",
+]
+
+STICK_DEFAULTS: dict[str, Any] = {
+    "deadzone_shape": "radial",
+    "deadzone": 0.0,
+    "outer_deadzone": 0.0,
+    "anti_deadzone": 0.0,
+    "curve": 1.0,
+    "axial_deadzone": 0.0,
+    "sloped_dominance_curve": 0.0,
+    "outer_circle_clamp": False,
+}
+
+TRIGGER_DEFAULTS: dict[str, Any] = {
+    "deadzone": 0.0,
+    "outer_deadzone": 0.0,
+    "anti_deadzone": 0.0,
+    "curve": 1.0,
+}
+
+NEW_PROFILE_TEMPLATE: dict[str, Any] = {
+    "left": {
+        "deadzone_shape": "radial",
+        "deadzone": 0.0025,
+        "anti_deadzone": 0.2,
+        "curve": 1.0,
+    },
+    "right": {
+        "deadzone_shape": "radial",
+        "deadzone": 0.0025,
+        "anti_deadzone": 0.2,
+        "curve": 1.0,
+    },
+}
+
+
+def get_default_config_path() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "hestia" / "anti-deadzone" / "config.json"
+
+
+def get_pid_path() -> Path:
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    return runtime / "hestia-antideadzone.pid"
+
+
+class ResponseCurvePreview(Gtk.DrawingArea):
+    """Real-time Cairo preview of raw-to-virtual deflection, deadzones, and gamma curve."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_content_width(280)
+        self.set_content_height(185)
+        self.set_hexpand(True)
+        self.params: dict[str, Any] = copy.deepcopy(STICK_DEFAULTS)
+        self.set_draw_func(self._on_draw)
+
+    def update_params(self, params: dict[str, Any]) -> None:
+        self.params = copy.deepcopy(STICK_DEFAULTS)
+        self.params.update(params)
+        self.queue_draw()
+
+    def _eval_curve(self, x: float) -> float:
+        dz = float(self.params.get("deadzone", 0.0))
+        outer_dz = float(self.params.get("outer_deadzone", 0.0))
+        adz = float(self.params.get("anti_deadzone", 0.0))
+        gamma = max(0.05, float(self.params.get("curve", 1.0)))
+        max_in = max(dz + 0.001, 1.0 - outer_dz)
+
+        if x <= dz:
+            return 0.0
+        if x >= max_in:
+            return 1.0
+        norm = (x - dz) / (max_in - dz)
+        return min(1.0, adz + (1.0 - adz) * math.pow(norm, gamma))
+
+    def _on_draw(self, _area: Gtk.DrawingArea, cr: Any, width: int, height: int) -> None:
+        pad = 16.0
+        w = max(10.0, width - 2 * pad)
+        h = max(10.0, height - 2 * pad)
+
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.08)
+        cr.rectangle(pad, pad, w, h)
+        cr.fill()
+
+        # 25% grid lines
+        cr.set_line_width(1.0)
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.18)
+        for i in range(1, 4):
+            frac = i * 0.25
+            cr.move_to(pad + frac * w, pad)
+            cr.line_to(pad + frac * w, pad + h)
+            cr.move_to(pad, pad + frac * h)
+            cr.line_to(pad + w, pad + frac * h)
+        cr.stroke()
+
+        # 1:1 linear diagonal reference
+        cr.set_dash([4.0, 4.0])
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.35)
+        cr.move_to(pad, pad + h)
+        cr.line_to(pad + w, pad)
+        cr.stroke()
+        cr.set_dash([])
+
+        dz = float(self.params.get("deadzone", 0.0))
+        outer_dz = float(self.params.get("outer_deadzone", 0.0))
+
+        # Inner deadzone cutoff line
+        if 0.0 < dz < 1.0:
+            cr.set_source_rgba(0.90, 0.35, 0.30, 0.55)
+            cr.set_line_width(1.2)
+            cr.move_to(pad + dz * w, pad)
+            cr.line_to(pad + dz * w, pad + h)
+            cr.stroke()
+
+        # Outer deadzone saturation line
+        if 0.0 < outer_dz < 1.0:
+            sat_x = 1.0 - outer_dz
+            cr.set_source_rgba(0.95, 0.65, 0.20, 0.55)
+            cr.set_line_width(1.2)
+            cr.move_to(pad + sat_x * w, pad)
+            cr.line_to(pad + sat_x * w, pad + h)
+            cr.stroke()
+
+        # Shaped response curve
+        cr.set_source_rgba(0.21, 0.52, 0.89, 0.95)
+        cr.set_line_width(2.4)
+        steps = 200
+        for i in range(steps + 1):
+            x = i / steps
+            y = self._eval_curve(x)
+            px = pad + x * w
+            py = pad + (1.0 - y) * h
+            if i == 0:
+                cr.move_to(px, py)
+            else:
+                cr.line_to(px, py)
+        cr.stroke()
+
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.3)
+        cr.set_line_width(1.0)
+        cr.rectangle(pad, pad, w, h)
+        cr.stroke()
+
+
+class AdzWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application, config_path: Path) -> None:
+        super().__init__(application=app)
+        self.set_title("Hestia Anti-Deadzone")
+        self.set_default_size(760, 900)
+
+        self.config_path = config_path
+        self.pid_path = get_pid_path()
+        self.config: dict[str, Any] = {}
+        self._load_error: str | None = None
+        self._updating_ui = False
+        self._save_timer_id: int | None = None
+        self._active_stick_key = "right"
+
+        self._load_config()
+        self._build_ui()
+        self._sync_ui_from_config()
+
+        if self._load_error:
+            GLib.idle_add(self._show_toast, self._load_error)
+
+        GLib.timeout_add_seconds(2, self._refresh_daemon_status)
+
+    # ------------------------------------------------------------------
+    # Config I/O & Daemon IPC
+    # ------------------------------------------------------------------
+    def _load_config(self) -> None:
+        self._load_error = None
+        if not self.config_path.exists():
+            self._load_error = f"Config not found at {self.config_path}"
+            self.config = {
+                "paused": False,
+                "device_name_match": "",
+                "active_profile": "default",
+                "max_output_hz": 250,
+                "reload_interval": 1.0,
+                "rescan_interval": 1.0,
+                "debug_sample_rate": 0,
+                "realtime_priority": False,
+                "profiles": {
+                    "default": copy.deepcopy(NEW_PROFILE_TEMPLATE),
+                },
+            }
+            return
+
+        try:
+            raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._load_error = f"JSON parse error: {exc}"
+            self.config = {
+                "active_profile": "default",
+                "profiles": {"default": copy.deepcopy(NEW_PROFILE_TEMPLATE)},
+            }
+            return
+
+        if not isinstance(raw, dict):
+            self._load_error = "Invalid config.json root (expected object)"
+            raw = {}
+
+        profiles = raw.get("profiles")
+        if not isinstance(profiles, dict) or not profiles:
+            raw["profiles"] = {"default": copy.deepcopy(NEW_PROFILE_TEMPLATE)}
+
+        for name, prof in raw["profiles"].items():
+            if not isinstance(prof, dict):
+                raw["profiles"][name] = copy.deepcopy(NEW_PROFILE_TEMPLATE)
+                continue
+            prof.setdefault("left", {})
+            prof.setdefault("right", {})
+
+        if raw.get("active_profile") not in raw["profiles"]:
+            raw["active_profile"] = next(iter(raw["profiles"]))
+
+        self.config = raw
+
+    def _write_config_atomic(self, notify_daemon: bool = True) -> None:
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(self.config, indent=2, sort_keys=False) + "\n"
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".config-",
+            suffix=".tmp",
+            dir=str(self.config_path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, self.config_path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+
+        if notify_daemon:
+            self._signal_daemon_reload()
+
+    def _schedule_save(self) -> None:
+        if self._updating_ui:
+            return
+        if self._save_timer_id is not None:
+            GLib.source_remove(self._save_timer_id)
+        self._save_timer_id = GLib.timeout_add(150, self._commit_save)
+
+    def _commit_save(self) -> bool:
+        self._save_timer_id = None
+        try:
+            self._write_config_atomic(notify_daemon=True)
+        except Exception as exc:
+            self._show_toast(f"Save failed: {exc}")
+        return False
+
+    def _get_daemon_pid(self) -> int | None:
+        if not self.pid_path.exists():
+            return None
+        try:
+            pid = int(self.pid_path.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            return pid
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            return None
+
+    def _signal_daemon_reload(self) -> None:
+        pid = self._get_daemon_pid()
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGHUP)
+            except OSError:
+                pass
+
+    def _refresh_daemon_status(self) -> bool:
+        pid = self._get_daemon_pid()
+        paused = bool(self.config.get("paused", False))
+        path_hint = str(self.config_path).replace(str(Path.home()), "~")
+        if pid is None:
+            self.window_title.set_subtitle(f"Daemon inactive · {path_hint}")
+        elif paused:
+            self.window_title.set_subtitle(f"Paused · PID {pid} · {path_hint}")
+        else:
+            self.window_title.set_subtitle(f"Active · PID {pid} · {path_hint}")
+        return True
+
+    def _show_toast(self, message: str) -> None:
+        self.toast_overlay.add_toast(Adw.Toast.new(message))
+
+    # ------------------------------------------------------------------
+    # UI Construction
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        toolbar_view = Adw.ToolbarView()
+        self.set_content(toolbar_view)
+
+        header = Adw.HeaderBar()
+        self.window_title = Adw.WindowTitle(
+            title="Hestia Anti-Deadzone",
+            subtitle="Loading…",
+        )
+        header.set_title_widget(self.window_title)
+
+        self.header_pause_btn = Gtk.ToggleButton(label="Active")
+        self.header_pause_btn.set_tooltip_text("Pause or resume anti-deadzone shaping")
+        self.header_pause_btn.connect("toggled", self._on_header_pause_toggled)
+        header.pack_end(self.header_pause_btn)
+
+        tools_btn = Gtk.MenuButton(icon_name="utilities-terminal-symbolic")
+        tools_btn.set_tooltip_text("Diagnostics & CLI Actions")
+        menu = Gio.Menu()
+        menu.append("Show Detected Controllers", "win.show_devices")
+        menu.append("Validate Config via adz", "win.validate_config")
+        menu.append("Reload Config from Disk", "win.reload_disk")
+        tools_btn.set_menu_model(menu)
+        header.pack_start(tools_btn)
+
+        self._register_actions()
+        toolbar_view.add_top_bar(header)
+
+        self.toast_overlay = Adw.ToastOverlay()
+        toolbar_view.set_content(self.toast_overlay)
+
+        page = Adw.PreferencesPage()
+        self.toast_overlay.set_child(page)
+
+        # 1. Profile Management Group
+        profile_group = Adw.PreferencesGroup(
+            title="Profiles",
+            description="Switch, create, duplicate, rename, or delete controller profiles.",
+        )
+        page.add(profile_group)
+
+        self.profile_row = Adw.ComboRow(title="Active Profile")
+        self.profile_row.set_enable_search(True)
+        self.profile_row.connect("notify::selected", self._on_profile_selected)
+        profile_group.add(self.profile_row)
+
+        actions_row = Adw.ActionRow(
+            title="Manage Profiles",
+            subtitle="Changes write immediately to config.json and signal SIGHUP",
+        )
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btn_box.set_valign(Gtk.Align.CENTER)
+
+        self.btn_new = Gtk.Button(label="New")
+        self.btn_new.add_css_class("suggested-action")
+        self.btn_new.connect("clicked", self._on_new_profile)
+
+        self.btn_dup = Gtk.Button(label="Duplicate")
+        self.btn_dup.connect("clicked", self._on_duplicate_profile)
+
+        self.btn_rename = Gtk.Button(label="Rename")
+        self.btn_rename.connect("clicked", self._on_rename_profile)
+
+        self.btn_delete = Gtk.Button(label="Delete")
+        self.btn_delete.add_css_class("destructive-action")
+        self.btn_delete.connect("clicked", self._on_delete_profile)
+
+        for b in (self.btn_new, self.btn_dup, self.btn_rename, self.btn_delete):
+            btn_box.append(b)
+        actions_row.add_suffix(btn_box)
+        profile_group.add(actions_row)
+
+        # 2. Analog Stick Shaping Group
+        stick_group = Adw.PreferencesGroup(
+            title="Analog Stick Shaping",
+            description="Configure per-stick deadzone geometry and response curves.",
+        )
+        page.add(stick_group)
+
+        stick_sel_row = Adw.ActionRow(title="Target Analog Stick")
+        toggle_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        toggle_box.add_css_class("linked")
+        toggle_box.set_valign(Gtk.Align.CENTER)
+
+        self.left_stick_btn = Gtk.ToggleButton(label="Left Stick (LS)")
+        self.right_stick_btn = Gtk.ToggleButton(label="Right Stick (RS)")
+        self.right_stick_btn.set_group(self.left_stick_btn)
+        self.right_stick_btn.set_active(True)
+
+        self.left_stick_btn.connect("toggled", self._on_stick_target_toggled)
+        self.right_stick_btn.connect("toggled", self._on_stick_target_toggled)
+
+        toggle_box.append(self.left_stick_btn)
+        toggle_box.append(self.right_stick_btn)
+        stick_sel_row.add_suffix(toggle_box)
+        stick_group.add(stick_sel_row)
+
+        self.curve_preview = ResponseCurvePreview()
+        preview_row = Adw.ActionRow()
+        preview_row.set_child(self.curve_preview)
+        stick_group.add(preview_row)
+
+        self.shape_row = Adw.ComboRow(
+            title="Deadzone Shape",
+            subtitle="Geometry used to calculate inner deadzone and anti-deadzone compensation",
+        )
+        self.shape_row.set_model(Gtk.StringList.new(SHAPE_LABELS))
+        self.shape_row.connect("notify::selected", self._on_stick_param_changed)
+        stick_group.add(self.shape_row)
+
+        self.dz_row = self._make_spin_row(
+            "Inner Deadzone",
+            "Physical deflection ignored near center (0.0025 = 0.25%)",
+            0.0, 0.50, 0.0025, 4, self._on_stick_param_changed,
+        )
+        stick_group.add(self.dz_row)
+
+        self.outer_dz_row = self._make_spin_row(
+            "Outer Deadzone",
+            "Margin at outer rim mapped to 100% virtual deflection",
+            0.0, 0.50, 0.005, 3, self._on_stick_param_changed,
+        )
+        stick_group.add(self.outer_dz_row)
+
+        self.adz_row = self._make_spin_row(
+            "Anti-Deadzone",
+            "Minimum virtual output jumped immediately past inner deadzone",
+            0.0, 0.60, 0.005, 3, self._on_stick_param_changed,
+        )
+        stick_group.add(self.adz_row)
+
+        self.curve_row = self._make_spin_row(
+            "Response Curve Exponent",
+            "1.00 = linear, >1.00 = finer micro-aim near center, <1.00 = faster ramp",
+            0.20, 4.00, 0.05, 2, self._on_stick_param_changed,
+        )
+        stick_group.add(self.curve_row)
+
+        self.axial_dz_row = self._make_spin_row(
+            "Axial Deadzone",
+            "Cardinal axis band / squircle factor (for smooth_axial, squircle, axial)",
+            0.0, 1.00, 0.01, 2, self._on_stick_param_changed,
+        )
+        stick_group.add(self.axial_dz_row)
+
+        self.slope_row = self._make_spin_row(
+            "Sloped Dominance Curve",
+            "Cardinal dominance scaling for sloped_axial geometry",
+            0.0, 2.00, 0.05, 2, self._on_stick_param_changed,
+        )
+        stick_group.add(self.slope_row)
+
+        self.clamp_row = Adw.SwitchRow(
+            title="Outer Circle Clamp",
+            subtitle="Clamp diagonal magnitudes to the unit circle (radius ≤ 1.0)",
+        )
+        self.clamp_row.connect("notify::active", self._on_stick_param_changed)
+        stick_group.add(self.clamp_row)
+
+        copy_stick_row = Adw.ActionRow(
+            title="Mirror Stick Settings",
+            subtitle="Copy current stick parameters to the opposite stick",
+        )
+        copy_btn = Gtk.Button(label="Copy to Other Stick")
+        copy_btn.set_valign(Gtk.Align.CENTER)
+        copy_btn.connect("clicked", self._on_copy_stick_settings)
+        copy_stick_row.add_suffix(copy_btn)
+        stick_group.add(copy_stick_row)
+
+        # 3. Analog Triggers Group
+        trig_group = Adw.PreferencesGroup(
+            title="Analog Triggers (LT / RT)",
+            description="Per-profile trigger deadzones, anti-deadzones, and response curves.",
+        )
+        page.add(trig_group)
+
+        self.lt_dz_row = self._make_spin_row(
+            "Left Trigger (LT) Inner Deadzone", None, 0.0, 0.50, 0.01, 3, self._on_trigger_changed
+        )
+        self.lt_outer_dz_row = self._make_spin_row(
+            "Left Trigger (LT) Outer Deadzone", None, 0.0, 0.50, 0.01, 3, self._on_trigger_changed
+        )
+        self.lt_adz_row = self._make_spin_row(
+            "Left Trigger (LT) Anti-Deadzone", None, 0.0, 0.50, 0.01, 3, self._on_trigger_changed
+        )
+        self.lt_curve_row = self._make_spin_row(
+            "Left Trigger (LT) Curve", None, 0.20, 4.00, 0.05, 2, self._on_trigger_changed
+        )
+
+        self.rt_dz_row = self._make_spin_row(
+            "Right Trigger (RT) Inner Deadzone", None, 0.0, 0.50, 0.01, 3, self._on_trigger_changed
+        )
+        self.rt_outer_dz_row = self._make_spin_row(
+            "Right Trigger (RT) Outer Deadzone", None, 0.0, 0.50, 0.01, 3, self._on_trigger_changed
+        )
+        self.rt_adz_row = self._make_spin_row(
+            "Right Trigger (RT) Anti-Deadzone", None, 0.0, 0.50, 0.01, 3, self._on_trigger_changed
+        )
+        self.rt_curve_row = self._make_spin_row(
+            "Right Trigger (RT) Curve", None, 0.20, 4.00, 0.05, 2, self._on_trigger_changed
+        )
+
+        for r in (
+            self.lt_dz_row,
+            self.lt_outer_dz_row,
+            self.lt_adz_row,
+            self.lt_curve_row,
+            self.rt_dz_row,
+            self.rt_outer_dz_row,
+            self.rt_adz_row,
+            self.rt_curve_row,
+        ):
+            trig_group.add(r)
+
+        # 4. Global Daemon Settings Group
+        global_group = Adw.PreferencesGroup(
+            title="Global Daemon Settings",
+            description="System-wide behavior across all profiles.",
+        )
+        page.add(global_group)
+
+        self.paused_row = Adw.SwitchRow(
+            title="Bypass Shaping (Paused)",
+            subtitle="Pass physical controller inputs unmodified to the virtual Xbox 360 device",
+        )
+        self.paused_row.connect("notify::active", self._on_global_changed)
+        global_group.add(self.paused_row)
+
+        self.device_match_row = Adw.EntryRow(title="Device Name Match Filter")
+        self.device_match_row.connect("changed", self._on_global_changed)
+        global_group.add(self.device_match_row)
+
+        self.hz_row = Adw.SpinRow.new_with_range(60, 2000, 10)
+        self.hz_row.set_title("Max Output Polling Rate (Hz)")
+        self.hz_row.set_digits(0)
+        self.hz_row.connect("notify::value", self._on_global_changed)
+        global_group.add(self.hz_row)
+
+        self.reload_interval_row = self._make_spin_row(
+            "Config Reload Interval (s)",
+            "Fallback polling interval if inotify events are missed",
+            0.1, 10.0, 0.1, 1, self._on_global_changed,
+        )
+        global_group.add(self.reload_interval_row)
+
+        self.rescan_interval_row = self._make_spin_row(
+            "Device Rescan Interval (s)",
+            "Interval for scanning newly connected physical controllers",
+            0.1, 10.0, 0.1, 1, self._on_global_changed,
+        )
+        global_group.add(self.rescan_interval_row)
+
+        self.debug_rate_row = Adw.SpinRow.new_with_range(0, 1000, 1)
+        self.debug_rate_row.set_title("Debug Sample Rate")
+        self.debug_rate_row.set_subtitle("0 disables debug telemetry logging")
+        self.debug_rate_row.set_digits(0)
+        self.debug_rate_row.connect("notify::value", self._on_global_changed)
+        global_group.add(self.debug_rate_row)
+
+        self.rt_prio_row = Adw.SwitchRow(
+            title="Realtime Scheduling Priority",
+            subtitle="Request SCHED_FIFO / elevated priority when permitted",
+        )
+        self.rt_prio_row.connect("notify::active", self._on_global_changed)
+        global_group.add(self.rt_prio_row)
+
+    def _make_spin_row(
+        self,
+        title: str,
+        subtitle: str | None,
+        low: float,
+        high: float,
+        step: float,
+        digits: int,
+        callback: Any,
+    ) -> Adw.SpinRow:
+        row = Adw.SpinRow.new_with_range(low, high, step)
+        row.set_title(title)
+        if subtitle:
+            row.set_subtitle(subtitle)
+        row.set_digits(digits)
+        row.connect("notify::value", callback)
+        return row
+
+    # ------------------------------------------------------------------
+    # State <-> UI Synchronization
+    # ------------------------------------------------------------------
+    def _current_profile_name(self) -> str:
+        return str(self.config["active_profile"])
+
+    def _current_profile(self) -> dict[str, Any]:
+        return self.config["profiles"][self._current_profile_name()]
+
+    def _sync_ui_from_config(self) -> None:
+        self._updating_ui = True
+        try:
+            names = list(self.config["profiles"].keys())
+            active = self._current_profile_name()
+            self.profile_row.set_model(Gtk.StringList.new(names))
+            self.profile_row.set_selected(names.index(active))
+            self.btn_delete.set_sensitive(len(names) > 1)
+
+            paused = bool(self.config.get("paused", False))
+            self.paused_row.set_active(paused)
+            self.header_pause_btn.set_active(paused)
+            self.header_pause_btn.set_label("Paused" if paused else "Active")
+
+            self.device_match_row.set_text(str(self.config.get("device_name_match", "")))
+            self.hz_row.set_value(float(self.config.get("max_output_hz", 250)))
+            self.reload_interval_row.set_value(float(self.config.get("reload_interval", 1.0)))
+            self.rescan_interval_row.set_value(float(self.config.get("rescan_interval", 1.0)))
+            self.debug_rate_row.set_value(float(self.config.get("debug_sample_rate", 0)))
+            self.rt_prio_row.set_active(bool(self.config.get("realtime_priority", False)))
+
+            self._sync_stick_ui()
+            self._sync_trigger_ui()
+            self._refresh_daemon_status()
+        finally:
+            self._updating_ui = False
+
+    def _sync_stick_ui(self) -> None:
+        prof = self._current_profile()
+        stick = prof.setdefault(self._active_stick_key, {})
+
+        shape = stick.get("deadzone_shape", "radial")
+        idx = SHAPES.index(shape) if shape in SHAPES else 0
+        self.shape_row.set_selected(idx)
+
+        self.dz_row.set_value(float(stick.get("deadzone", STICK_DEFAULTS["deadzone"])))
+        self.outer_dz_row.set_value(
+            float(stick.get("outer_deadzone", STICK_DEFAULTS["outer_deadzone"]))
+        )
+        self.adz_row.set_value(
+            float(stick.get("anti_deadzone", STICK_DEFAULTS["anti_deadzone"]))
+        )
+        self.curve_row.set_value(float(stick.get("curve", STICK_DEFAULTS["curve"])))
+        self.axial_dz_row.set_value(
+            float(stick.get("axial_deadzone", STICK_DEFAULTS["axial_deadzone"]))
+        )
+        self.slope_row.set_value(
+            float(
+                stick.get(
+                    "sloped_dominance_curve", STICK_DEFAULTS["sloped_dominance_curve"]
+                )
+            )
+        )
+        self.clamp_row.set_active(
+            bool(stick.get("outer_circle_clamp", STICK_DEFAULTS["outer_circle_clamp"]))
+        )
+
+        self.curve_preview.update_params(stick)
+
+    def _sync_trigger_ui(self) -> None:
+        prof = self._current_profile()
+        lt = prof.get("left_trigger", {})
+        rt = prof.get("right_trigger", {})
+
+        self.lt_dz_row.set_value(float(lt.get("deadzone", TRIGGER_DEFAULTS["deadzone"])))
+        self.lt_outer_dz_row.set_value(
+            float(lt.get("outer_deadzone", TRIGGER_DEFAULTS["outer_deadzone"]))
+        )
+        self.lt_adz_row.set_value(
+            float(lt.get("anti_deadzone", TRIGGER_DEFAULTS["anti_deadzone"]))
+        )
+        self.lt_curve_row.set_value(float(lt.get("curve", TRIGGER_DEFAULTS["curve"])))
+
+        self.rt_dz_row.set_value(float(rt.get("deadzone", TRIGGER_DEFAULTS["deadzone"])))
+        self.rt_outer_dz_row.set_value(
+            float(rt.get("outer_deadzone", TRIGGER_DEFAULTS["outer_deadzone"]))
+        )
+        self.rt_adz_row.set_value(
+            float(rt.get("anti_deadzone", TRIGGER_DEFAULTS["anti_deadzone"]))
+        )
+        self.rt_curve_row.set_value(float(rt.get("curve", TRIGGER_DEFAULTS["curve"])))
+
+    # ------------------------------------------------------------------
+    # Event Handlers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _set_clean_field(target: dict[str, Any], key: str, value: Any, default: Any) -> None:
+        """Update key if already present or non-default, keeping profiles uncluttered."""
+        if key in target or value != default:
+            target[key] = value
+
+    def _on_header_pause_toggled(self, btn: Gtk.ToggleButton) -> None:
+        if self._updating_ui:
+            return
+        self.paused_row.set_active(btn.get_active())
+
+    def _on_global_changed(self, *_args: Any) -> None:
+        if self._updating_ui:
+            return
+        paused = self.paused_row.get_active()
+        self.config["paused"] = paused
+        self.config["device_name_match"] = self.device_match_row.get_text().strip()
+        self.config["max_output_hz"] = int(round(self.hz_row.get_value()))
+        self._set_clean_field(
+            self.config, "reload_interval", round(self.reload_interval_row.get_value(), 2), 1.0
+        )
+        self._set_clean_field(
+            self.config, "rescan_interval", round(self.rescan_interval_row.get_value(), 2), 1.0
+        )
+        self._set_clean_field(
+            self.config, "debug_sample_rate", int(round(self.debug_rate_row.get_value())), 0
+        )
+        self._set_clean_field(
+            self.config, "realtime_priority", self.rt_prio_row.get_active(), False
+        )
+
+        self._updating_ui = True
+        self.header_pause_btn.set_active(paused)
+        self.header_pause_btn.set_label("Paused" if paused else "Active")
+        self._updating_ui = False
+
+        self._refresh_daemon_status()
+        self._schedule_save()
+
+    def _on_profile_selected(self, row: Adw.ComboRow, _pspec: Any) -> None:
+        if self._updating_ui:
+            return
+        item = row.get_selected_item()
+        if item is None:
+            return
+        name = item.get_string()
+        if name in self.config["profiles"] and name != self.config.get("active_profile"):
+            self.config["active_profile"] = name
+            self._sync_ui_from_config()
+            self._schedule_save()
+            self._show_toast(f"Switched to profile “{name}”")
+
+    def _on_stick_target_toggled(self, _btn: Gtk.ToggleButton) -> None:
+        if self._updating_ui:
+            return
+        self._active_stick_key = "left" if self.left_stick_btn.get_active() else "right"
+        self._updating_ui = True
+        try:
+            self._sync_stick_ui()
+        finally:
+            self._updating_ui = False
+
+    def _on_stick_param_changed(self, *_args: Any) -> None:
+        if self._updating_ui:
+            return
+        stick = self._current_profile().setdefault(self._active_stick_key, {})
+        shape_idx = self.shape_row.get_selected()
+        shape = SHAPES[shape_idx] if 0 <= shape_idx < len(SHAPES) else "radial"
+
+        stick["deadzone_shape"] = shape
+        stick["deadzone"] = round(self.dz_row.get_value(), 4)
+        self._set_clean_field(
+            stick,
+            "outer_deadzone",
+            round(self.outer_dz_row.get_value(), 4),
+            STICK_DEFAULTS["outer_deadzone"],
+        )
+        stick["anti_deadzone"] = round(self.adz_row.get_value(), 4)
+        stick["curve"] = round(self.curve_row.get_value(), 3)
+        self._set_clean_field(
+            stick,
+            "axial_deadzone",
+            round(self.axial_dz_row.get_value(), 4),
+            STICK_DEFAULTS["axial_deadzone"],
+        )
+        self._set_clean_field(
+            stick,
+            "sloped_dominance_curve",
+            round(self.slope_row.get_value(), 3),
+            STICK_DEFAULTS["sloped_dominance_curve"],
+        )
+        self._set_clean_field(
+            stick,
+            "outer_circle_clamp",
+            self.clamp_row.get_active(),
+            STICK_DEFAULTS["outer_circle_clamp"],
+        )
+
+        self.curve_preview.update_params(stick)
+        self._schedule_save()
+
+    def _on_copy_stick_settings(self, _btn: Gtk.Button) -> None:
+        prof = self._current_profile()
+        other = "right" if self._active_stick_key == "left" else "left"
+        prof[other] = copy.deepcopy(prof.get(self._active_stick_key, {}))
+        self._schedule_save()
+        label = "Right Stick" if other == "right" else "Left Stick"
+        self._show_toast(f"Copied settings to {label}")
+
+    def _on_trigger_changed(self, *_args: Any) -> None:
+        if self._updating_ui:
+            return
+        prof = self._current_profile()
+
+        lt_vals = {
+            "deadzone": round(self.lt_dz_row.get_value(), 3),
+            "outer_deadzone": round(self.lt_outer_dz_row.get_value(), 3),
+            "anti_deadzone": round(self.lt_adz_row.get_value(), 3),
+            "curve": round(self.lt_curve_row.get_value(), 2),
+        }
+        if "left_trigger" in prof or lt_vals != TRIGGER_DEFAULTS:
+            lt = prof.setdefault("left_trigger", {})
+            for k, v in lt_vals.items():
+                self._set_clean_field(lt, k, v, TRIGGER_DEFAULTS[k])
+
+        rt_vals = {
+            "deadzone": round(self.rt_dz_row.get_value(), 3),
+            "outer_deadzone": round(self.rt_outer_dz_row.get_value(), 3),
+            "anti_deadzone": round(self.rt_adz_row.get_value(), 3),
+            "curve": round(self.rt_curve_row.get_value(), 2),
+        }
+        if "right_trigger" in prof or rt_vals != TRIGGER_DEFAULTS:
+            rt = prof.setdefault("right_trigger", {})
+            for k, v in rt_vals.items():
+                self._set_clean_field(rt, k, v, TRIGGER_DEFAULTS[k])
+
+        self._schedule_save()
+
+    # ------------------------------------------------------------------
+    # Profile CRUD Dialogs
+    # ------------------------------------------------------------------
+    def _prompt_profile_name(
+        self, heading: str, body: str, initial: str, confirm_label: str, on_accept: Any
+    ) -> None:
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("confirm", confirm_label)
+        dialog.set_response_appearance("confirm", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("confirm")
+
+        entry = Gtk.Entry(text=initial)
+        entry.set_activates_default(True)
+        dialog.set_extra_child(entry)
+
+        def _handle_response(dlg: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
+            if dlg.choose_finish(result) == "confirm":
+                name = entry.get_text().strip()
+                if name:
+                    on_accept(name)
+
+        dialog.choose(self, None, _handle_response)
+
+    def _on_new_profile(self, _btn: Gtk.Button) -> None:
+        def _create(name: str) -> None:
+            if name in self.config["profiles"]:
+                self._show_toast(f"Profile “{name}” already exists")
+                return
+            self.config["profiles"][name] = copy.deepcopy(NEW_PROFILE_TEMPLATE)
+            self.config["active_profile"] = name
+            self._sync_ui_from_config()
+            self._schedule_save()
+            self._show_toast(f"Created profile “{name}”")
+
+        self._prompt_profile_name(
+            "New Profile",
+            "Enter a unique name for the new controller profile:",
+            "",
+            "Create",
+            _create,
+        )
+
+    def _on_duplicate_profile(self, _btn: Gtk.Button) -> None:
+        src = self._current_profile_name()
+
+        def _duplicate(name: str) -> None:
+            if name in self.config["profiles"]:
+                self._show_toast(f"Profile “{name}” already exists")
+                return
+            self.config["profiles"][name] = copy.deepcopy(self.config["profiles"][src])
+            self.config["active_profile"] = name
+            self._sync_ui_from_config()
+            self._schedule_save()
+            self._show_toast(f"Duplicated “{src}” → “{name}”")
+
+        self._prompt_profile_name(
+            "Duplicate Profile",
+            f"Create a copy of “{src}”:",
+            f"{src}-copy",
+            "Duplicate",
+            _duplicate,
+        )
+
+    def _on_rename_profile(self, _btn: Gtk.Button) -> None:
+        old = self._current_profile_name()
+
+        def _rename(new_name: str) -> None:
+            if new_name == old:
+                return
+            if new_name in self.config["profiles"]:
+                self._show_toast(f"Profile “{new_name}” already exists")
+                return
+            rebuilt: dict[str, Any] = {}
+            for k, v in self.config["profiles"].items():
+                rebuilt[new_name if k == old else k] = v
+            self.config["profiles"] = rebuilt
+            self.config["active_profile"] = new_name
+            self._sync_ui_from_config()
+            self._schedule_save()
+            self._show_toast(f"Renamed to “{new_name}”")
+
+        self._prompt_profile_name(
+            "Rename Profile",
+            f"Enter a new name for “{old}”:",
+            old,
+            "Rename",
+            _rename,
+        )
+
+    def _on_delete_profile(self, _btn: Gtk.Button) -> None:
+        if len(self.config["profiles"]) <= 1:
+            return
+        target = self._current_profile_name()
+        dialog = Adw.AlertDialog(
+            heading=f"Delete “{target}”?",
+            body="This profile will be permanently removed from config.json.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def _handle(dlg: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
+            if dlg.choose_finish(result) == "delete":
+                del self.config["profiles"][target]
+                self.config["active_profile"] = next(iter(self.config["profiles"]))
+                self._sync_ui_from_config()
+                self._schedule_save()
+                self._show_toast(f"Deleted profile “{target}”")
+
+        dialog.choose(self, None, _handle)
+
+    # ------------------------------------------------------------------
+    # Menu Actions
+    # ------------------------------------------------------------------
+    def _register_actions(self) -> None:
+        actions = {
+            "show_devices": self._action_show_devices,
+            "validate_config": self._action_validate_config,
+            "reload_disk": self._action_reload_disk,
+        }
+        for name, fn in actions.items():
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", fn)
+            self.add_action(act)
+
+    def _run_cli_dialog(self, title: str, args: list[str]) -> None:
+        try:
+            proc = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            output = (proc.stdout or proc.stderr or "(no output)").strip()
+        except FileNotFoundError:
+            output = f"Command not found: {args[0]}"
+        except Exception as exc:
+            output = str(exc)
+
+        dialog = Adw.AlertDialog(heading=title, body=output)
+        dialog.add_response("close", "Close")
+        dialog.choose(self, None, lambda d, r: d.choose_finish(r))
+
+    def _action_show_devices(self, *_args: Any) -> None:
+        self._run_cli_dialog("Detected Input Devices", ["adz", "devices"])
+
+    def _action_validate_config(self, *_args: Any) -> None:
+        self._commit_save()
+        self._run_cli_dialog("Config Validation", ["adz", "validate"])
+
+    def _action_reload_disk(self, *_args: Any) -> None:
+        self._load_config()
+        self._sync_ui_from_config()
+        self._show_toast(self._load_error or "Reloaded configuration from disk")
+
+
+class AdzApplication(Adw.Application):
+    def __init__(self, config_path: Path) -> None:
+        super().__init__(
+            application_id=APP_ID,
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
+        )
+        self.config_path = config_path
+
+    def do_activate(self) -> None:
+        win = self.props.active_window
+        if not win:
+            win = AdzWindow(self, self.config_path)
+        win.present()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Hestia Anti-Deadzone GUI")
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        default=get_default_config_path(),
+        help="Path to config.json (default: ~/.config/hestia/anti-deadzone/config.json)",
+    )
+    args, remaining = parser.parse_known_args()
+    app = AdzApplication(args.config.expanduser())
+    return app.run([sys.argv[0], *remaining])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
